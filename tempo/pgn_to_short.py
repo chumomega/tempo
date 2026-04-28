@@ -1,4 +1,4 @@
-"""CLI: PGN -> 1080x1920 MP4 with gunshot SFX on attacking moves."""
+"""CLI: PGN -> 1080x1920 MP4 with one-sound-per-ply and a piece-slide animation."""
 
 from __future__ import annotations
 
@@ -8,49 +8,89 @@ import sys
 from pathlib import Path
 
 import chess
-import chess.pgn
 
 from .audio import (
-    AudioEvent,
+    Layer,
+    PlyAudio,
     build_audio_track,
-    ensure_click,
-    ensure_gunshot,
-    mux_video,
+    ensure_all_sfx,
+    mux_video_concat,
 )
-from .engine import GameMeta, PlyState, iter_plies, load_game
-from .render import Fonts, render_frame
+from .engine import PlyState, iter_plies, load_game
+from .render import Fonts, render_animation_frame, render_frame
 
 
-def _square_name(sq: chess.Square) -> str:
-    return chess.square_name(sq)
+# Per-ply on-screen durations (seconds). Mate gets the longest hold; checks
+# linger so the fahh has room to breathe.
+DUR_BASE = 1.3
+DUR_CAPTURE = 1.8
+DUR_CHECK = 2.5
+DUR_MATE = 4.0
+DUR_START = 1.3   # how long the starting position holds before move 1
+
+# Piece-slide animation. Each ply renders SLIDE_STEPS in-flight frames at
+# SLIDE_DUR / SLIDE_STEPS seconds each, followed by the post-move frame.
+SLIDE_STEPS = 5
+SLIDE_DUR = 0.30
 
 
-def _print_log(state: PlyState) -> None:
-    move_num = state.move_number
-    prefix = f"{move_num}." if state.ply_index % 2 == 1 else f"{move_num}..."
+def _print_log(state: PlyState, sfx: str) -> None:
+    prefix = (f"{state.move_number}." if state.ply_index % 2 == 1
+              else f"{state.move_number}...")
     label = f"{prefix} {state.san}"
+    tags: list[str] = []
     if state.is_checkmate:
-        tag = "MATE   "
-    elif state.attacked_enemy_squares:
-        tag = "ATTACK "
-    else:
-        tag = "       "
-    attacks = [_square_name(s) for s in state.attacked_enemy_squares]
-    print(f"  ply {state.ply_index:>3}  {label:<14}  {tag}  attacks={attacks}")
+        tags.append("MATE")
+    elif state.is_check:
+        tags.append("CHECK")
+    if state.is_capture and not state.is_castling:
+        tags.append("CAPT")
+    if state.is_castling:
+        tags.append("CASTLE")
+    if state.gunshot_targets:
+        tags.append("THREAT")
+    tag = " ".join(tags) if tags else "       "
+    print(f"  ply {state.ply_index:>3}  {label:<14}  {tag:<22}  -> {sfx}")
+
+
+def _ply_duration(state: PlyState) -> float:
+    if state.is_checkmate:
+        return DUR_MATE
+    if state.is_check:
+        return DUR_CHECK
+    if state.is_capture or state.is_castling:
+        return DUR_CAPTURE
+    return DUR_BASE
+
+
+def _pick_sfx(state: PlyState) -> str:
+    """Pick the single SFX to fire for this ply.
+
+    Priority (highest wins):
+      castling > mate > bite (capture) > fahh (check) > gunshot (rule-B
+      threat) > thud (default).
+    """
+    if state.is_castling:
+        return "castling"
+    if state.is_checkmate:
+        return "mate"
+    if state.is_capture:
+        return "bite"
+    if state.is_check:
+        return "fahh"
+    if state.gunshot_targets:
+        return "gunshot"
+    return "thud"
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="PGN -> vertical MP4 short")
     p.add_argument("pgn", nargs="?", default="game.pgn",
                    help="path to PGN file (default: game.pgn)")
-    p.add_argument("--seconds-per-move", type=float, default=1.0,
-                   help="duration of each ply frame (default: 1.0)")
     p.add_argument("--start-from", type=int, default=1,
                    help="render only from this full-move number onward")
     p.add_argument("--out", type=Path, default=Path("out/chess_short.mp4"),
                    help="output mp4 path")
-    p.add_argument("--no-click", action="store_true",
-                   help="omit the soft click on non-attacking moves")
     p.add_argument("--keep-frames", action="store_true",
                    help="keep the rendered PNG frames and intermediate audio")
     args = p.parse_args(argv)
@@ -78,75 +118,97 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Loading PGN: {pgn_path}")
     meta, game = load_game(pgn_path)
     states_all = iter_plies(game)
-
-    # --start-from filters by full-move number; keep both white and black plies
-    # of any retained move number.
     states = [s for s in states_all if s.move_number >= args.start_from]
     if not states:
         print("No plies after applying --start-from filter.", file=sys.stderr)
         return 2
 
-    # Reconstruct positions for each retained ply by replaying from start.
-    # We render: starting frame (the position BEFORE the first retained ply),
-    # plus one frame per retained ply.
     board = game.board()
-    skipped = [s for s in states_all if s.move_number < args.start_from]
-    for s in skipped:
+    for s in states_all:
+        if s.move_number >= args.start_from:
+            break
         board.push(s.last_move)
 
     fonts = Fonts.build()
-
     print(f"Game: {meta.white} ({meta.white_elo}) vs "
           f"{meta.black} ({meta.black_elo}) — {meta.result}")
-    print(f"Rendering {len(states)} plies starting from move {args.start_from} ...")
+    print(f"Rendering {len(states)} plies starting from move "
+          f"{args.start_from} ...")
 
-    # Frame 000: the position before any retained ply (or starting position).
-    render_frame(
-        board=board, state=None, meta=meta, fonts=fonts,
-        out_path=frames_dir / "frame_000.png",
-    )
+    durations: list[float] = [DUR_START]
+    render_frame(board=board, state=None, meta=meta, fonts=fonts,
+                 out_path=frames_dir / "frame_000.png")
 
-    events: list[AudioEvent] = []
-    spm = float(args.seconds_per_move)
+    plies_audio: list[PlyAudio] = []
+    cursor = DUR_START
+    next_idx = 1
+    slide_step_dur = SLIDE_DUR / SLIDE_STEPS
 
-    for i, s in enumerate(states, start=1):
-        board.push(s.last_move)
-        _print_log(s)
+    for state in states:
+        ply_dur = _ply_duration(state)
+        sfx = _pick_sfx(state)
+        _print_log(state, sfx)
 
+        # Pre-move board with the mover removed, used to render slide frames.
+        moving_piece = board.piece_at(state.from_square)
+        animate = (not state.is_castling) and moving_piece is not None
+        if animate:
+            pre_anim_board = board.copy()
+            pre_anim_board.remove_piece_at(state.from_square)
+            # The capturer landing on the captured piece reads better if we
+            # leave the captured piece on to_sq; for en-passant the captured
+            # pawn is on a different square and stays put naturally.
+            for step in range(SLIDE_STEPS):
+                t = (step + 1) / (SLIDE_STEPS + 1)
+                render_animation_frame(
+                    pre_board=pre_anim_board,
+                    moving_piece=moving_piece,
+                    state=state, t=t,
+                    meta=meta, fonts=fonts,
+                    out_path=frames_dir / f"frame_{next_idx:03d}.png",
+                )
+                durations.append(slide_step_dur)
+                next_idx += 1
+
+        # Apply the move and render the static post-move (arrival) frame.
+        board.push(state.last_move)
         render_frame(
-            board=board, state=s, meta=meta, fonts=fonts,
-            out_path=frames_dir / f"frame_{i:03d}.png",
+            board=board, state=state, meta=meta, fonts=fonts,
+            out_path=frames_dir / f"frame_{next_idx:03d}.png",
         )
+        post_dur = ply_dur - (SLIDE_DUR if animate else 0.0)
+        durations.append(max(0.05, post_dur))
+        next_idx += 1
 
-        t = i * spm
-        if s.is_checkmate:
-            events.append(AudioEvent(t=t, kind="mate"))
-        elif s.attacked_enemy_squares:
-            events.append(AudioEvent(t=t, kind="shot"))
-        elif not args.no_click:
-            events.append(AudioEvent(t=t, kind="click"))
-
-    total_duration = (len(states) + 1) * spm
+        # SFX fires when the piece arrives — start of the post-move frame.
+        sfx_offset = SLIDE_DUR if animate else 0.0
+        plies_audio.append(
+            PlyAudio(
+                t_start=cursor + sfx_offset,
+                layers=[Layer(offset=0.0, kind=sfx)],
+            )
+        )
+        cursor += ply_dur
+    total_duration = cursor
 
     print("Preparing audio assets ...")
-    gunshot = ensure_gunshot(assets_dir)
-    click = ensure_click(assets_dir) if not args.no_click else gunshot
+    sfx_paths = ensure_all_sfx(assets_dir)
 
+    print(f"Building audio timeline ({len(plies_audio)} sounds, "
+          f"{total_duration:.1f}s total) ...")
     audio_path = project_root / "out" / "_audio.wav"
     audio_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Building audio timeline ({len(events)} events, "
-          f"{total_duration:.1f}s) ...")
     build_audio_track(
-        events=events,
+        plies=plies_audio,
         total_duration=total_duration,
-        gunshot=gunshot,
-        click=click,
+        sfx_paths=sfx_paths,
         out_path=audio_path,
     )
 
     print(f"Muxing video -> {out_path}")
-    mux_video(
+    mux_video_concat(
         frames_dir=frames_dir,
+        durations=durations,
         audio_path=audio_path,
         out_path=out_path,
     )
@@ -158,9 +220,12 @@ def main(argv: list[str] | None = None) -> int:
         except FileNotFoundError:
             pass
 
-    n_attack = sum(1 for e in events if e.kind in ("shot", "mate"))
-    print(f"Done. Wrote {out_path} ({total_duration:.1f}s, "
-          f"{n_attack} attacking plies).")
+    counts: dict[str, int] = {}
+    for pa in plies_audio:
+        kind = pa.layers[0].kind
+        counts[kind] = counts.get(kind, 0) + 1
+    breakdown = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    print(f"Done. Wrote {out_path} ({total_duration:.1f}s, {breakdown}).")
     return 0
 
 
