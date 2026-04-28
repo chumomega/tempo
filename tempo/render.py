@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,6 +84,12 @@ def _square_xy(sq: chess.Square) -> tuple[int, int]:
     file = chess.square_file(sq)
     rank = chess.square_rank(sq)
     return file * SQ, (7 - rank) * SQ
+
+
+def _square_center(sq: chess.Square) -> tuple[float, float]:
+    file = chess.square_file(sq)
+    rank = chess.square_rank(sq)
+    return (file * SQ + SQ / 2, (7 - rank) * SQ + SQ / 2)
 
 
 def _render_board_png(board: chess.Board, lastmove: chess.Move | None) -> Image.Image:
@@ -183,30 +190,45 @@ def _footer_san(ply_index: int, san: str, is_checkmate: bool) -> str:
     return f"{_move_number_label(ply_index)} {san}"
 
 
-def render_frame(
+_PIECE_SPRITE_CACHE: dict[tuple[chess.PieceType, chess.Color], Image.Image] = {}
+
+
+def _piece_sprite(piece: chess.Piece) -> Image.Image:
+    """Rasterize a single piece to a transparent PNG at SQ x SQ. Cached."""
+    key = (piece.piece_type, piece.color)
+    if key in _PIECE_SPRITE_CACHE:
+        return _PIECE_SPRITE_CACHE[key]
+    svg = chess.svg.piece(piece, size=SQ)
+    png_bytes = cairosvg.svg2png(
+        bytestring=svg.encode("utf-8"),
+        output_width=SQ, output_height=SQ,
+    )
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    _PIECE_SPRITE_CACHE[key] = img
+    return img
+
+
+def _render_canvas_with_board(
     *,
-    board: chess.Board,
+    board_img: Image.Image,
     state: PlyState | None,
     meta: GameMeta,
     fonts: Fonts,
-    out_path: Path,
-) -> None:
-    """Render a single frame to PNG. state=None means starting position."""
+    show_mate_footer: bool,
+) -> Image.Image:
+    """Wrap a board image with the standard header + footer chrome."""
     canvas = Image.new("RGBA", (W, H), BG + (255,))
     draw = ImageDraw.Draw(canvas)
 
-    # --- header ---
     draw.rectangle([0, 0, W, HEADER_H], fill=HEADER_BG)
     pad = 32
     name_y = HEADER_H // 2 - 22
     elo_y = HEADER_H // 2 + 36
 
-    white_label = meta.white or "White"
-    black_label = meta.black or "Black"
-    _draw_text_left(draw, white_label, pad, name_y, fonts.name, TEXT_FG)
+    _draw_text_left(draw, meta.white or "White", pad, name_y, fonts.name, TEXT_FG)
     if meta.white_elo:
         _draw_text_left(draw, meta.white_elo, pad, elo_y, fonts.elo, TEXT_DIM)
-    _draw_text_right(draw, black_label, W - pad, name_y, fonts.name, TEXT_FG)
+    _draw_text_right(draw, meta.black or "Black", W - pad, name_y, fonts.name, TEXT_FG)
     if meta.black_elo:
         _draw_text_right(draw, meta.black_elo, W - pad, elo_y, fonts.elo, TEXT_DIM)
 
@@ -215,22 +237,13 @@ def render_frame(
         _draw_text_centered(draw, move_label, W // 2, HEADER_H // 2,
                             fonts.move_num, TEXT_FG)
 
-    # --- board ---
-    board_img = _render_board_png(board, state.last_move if state else None)
-    if state is not None:
-        _draw_highlight(board_img, state.from_square)
-        _draw_highlight(board_img, state.to_square)
-        for sq in state.attacked_enemy_squares:
-            _draw_attack_ring(board_img, sq)
     canvas.alpha_composite(board_img, dest=(BOARD_X, BOARD_Y))
 
-    # --- footer ---
     draw.rectangle([0, H - FOOTER_H, W, H], fill=FOOTER_BG)
     if state is None:
-        # starting position frame: just show the result tag
         _draw_text_centered(draw, "Start", W // 2, H - FOOTER_H // 2,
                             fonts.footer, TEXT_FG)
-    elif state.is_checkmate:
+    elif show_mate_footer and state.is_checkmate:
         _draw_text_centered(draw, "CHECKMATE", W // 2, H - FOOTER_H // 2,
                             fonts.mate, MATE_RED)
     else:
@@ -242,5 +255,64 @@ def render_frame(
             fonts.footer,
             TEXT_FG,
         )
+    return canvas
 
+
+def render_animation_frame(
+    *,
+    pre_board: chess.Board,
+    moving_piece: chess.Piece,
+    state: PlyState,
+    t: float,
+    meta: GameMeta,
+    fonts: Fonts,
+    out_path: Path,
+) -> None:
+    """Render an in-flight slide frame: piece sprite at lerp(from, to, t).
+
+    pre_board must already have the mover removed from from_sq; if the move
+    is a capture, the captured piece is still on to_sq so it shows up under
+    the sliding piece. No attack rings, mate footer is hidden, but yellow
+    from/to highlights and the SAN are shown so the frame reads cleanly.
+    """
+    board_img = _render_board_png(pre_board, lastmove=None)
+    _draw_highlight(board_img, state.from_square)
+    _draw_highlight(board_img, state.to_square)
+
+    sprite = _piece_sprite(moving_piece)
+    fx, fy = _square_center(state.from_square)
+    tx, ty = _square_center(state.to_square)
+    cx = fx + (tx - fx) * t
+    cy = fy + (ty - fy) * t
+    px = int(round(cx - SQ / 2))
+    py = int(round(cy - SQ / 2))
+    board_img.alpha_composite(sprite, dest=(px, py))
+
+    canvas = _render_canvas_with_board(
+        board_img=board_img, state=state, meta=meta, fonts=fonts,
+        show_mate_footer=False,
+    )
+    canvas.convert("RGB").save(out_path, "PNG", optimize=True)
+
+
+def render_frame(
+    *,
+    board: chess.Board,
+    state: PlyState | None,
+    meta: GameMeta,
+    fonts: Fonts,
+    out_path: Path,
+) -> None:
+    """Render a static post-move (or starting-position) frame."""
+    board_img = _render_board_png(board, state.last_move if state else None)
+    if state is not None:
+        _draw_highlight(board_img, state.from_square)
+        _draw_highlight(board_img, state.to_square)
+        for sq in state.attacked_enemy_squares:
+            _draw_attack_ring(board_img, sq)
+
+    canvas = _render_canvas_with_board(
+        board_img=board_img, state=state, meta=meta, fonts=fonts,
+        show_mate_footer=True,
+    )
     canvas.convert("RGB").save(out_path, "PNG", optimize=True)
