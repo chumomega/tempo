@@ -1,0 +1,5 @@
+python-chess>=1.10
+pillow>=10
+cairosvg>=2.7
+yt-dlp>=2024.0
+pytest>=7

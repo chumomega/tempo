@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Generated artifacts
+frames/
+out/
+assets/gunshot.wav
+assets/click.wav
+
+# OS
+.DS_Store
