@@ -8,8 +8,7 @@ __pycache__/
 # Generated artifacts
 frames/
 out/
-assets/gunshot.wav
-assets/click.wav
+assets/*.wav
 
 # OS
 .DS_Store
